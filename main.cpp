@@ -691,6 +691,20 @@ void RenderToScreenWithColour(int xPos, int yPos, ConsoleColor colour, string ch
     ConsoleSetForegroundColor(WHITE);
 }
 
+// 駒の色（BP = 先手、WP = 後手）
+const ConsoleColor BP_COLOR = RED;
+const ConsoleColor WP_COLOR = CYAN;
+
+// 画面バッファの1マスに色付きの駒を書き込む。
+// エスケープシーケンスは1マス分の文字列に含めるので、表示幅（レイアウト）は変わらない。
+void WriteColoredPiece(int x, int y, Piece piece, GameLocalContext* ctx) {
+    if (piece != BLACK_PIECE && piece != WHITE_PIECE) return;
+    if (x < 0 || y < 0 || x >= ctx->session->sys.setting.screenWidth || y >= ctx->session->sys.setting.screenHeight) return;
+    ConsoleColor color = piece == BLACK_PIECE ? BP_COLOR : WP_COLOR;
+    string text = piece == BLACK_PIECE ? BP : WP;
+    ctx->ui.screenBuffer[x][y] = "\x1b[" + to_string(BOLD) + ";" + to_string(color) + "m" + text + "\x1b[22;39m";
+}
+
 string SpritesEnvironmentBorder(GameSession& gs) {
     // Allocate strings on the heap instead of the stack  
     string* topBorder = new string("╔" + JoinCopyStr(gs.sys.setting.spriteMaxWidth, "═") + "╗" + string(1, NEWLINE));
@@ -1489,6 +1503,13 @@ void WriteChessBoard(GameLocalContext* ctx) {
         strBuffer += NEWLINE;
     }
     WriteToBuffer(ctx->ui.offset.x, ctx->ui.offset.y, strBuffer, ctx);
+
+    // 駒だけ色を付けて上書きする（マス(x, y)の駒は罫線を含めて (4x + 2, 2y + 1) の位置にある）
+    for (int y = 0; y < ctx->ui.mnk.board.y; y++) {
+        for (int x = 0; x < ctx->ui.mnk.board.x; x++) {
+            WriteColoredPiece(ctx->ui.offset.x + 4 * x + 2, ctx->ui.offset.y + 2 * y + 1, ctx->data.game.chessData[y][x], ctx);
+        }
+    }
 }
 
 void WriteGameState(GameLocalContext* ctx) {
@@ -1506,6 +1527,7 @@ void WriteGameState(GameLocalContext* ctx) {
     string value = ctx->data.game.masterPlayer.marker == BLACK_PIECE ? BP : WP;
     startX -= titleKey.length();
     WriteToBuffer(startX, startY, titleKey + value, ctx);
+    WriteColoredPiece(startX + titleKey.length(), startY, ctx->data.game.masterPlayer.marker, ctx);
     startX += titleKey.length();
     startY++;
 
@@ -1549,6 +1571,7 @@ void WriteGameState(GameLocalContext* ctx) {
     value = ctx->data.game.slavePlayer.marker == BLACK_PIECE ? BP : WP;
     startX -= titleKey.length();
     WriteToBuffer(startX, startY, titleKey + value, ctx);
+    WriteColoredPiece(startX + titleKey.length(), startY, ctx->data.game.slavePlayer.marker, ctx);
     startX += titleKey.length();
     startY++;
 
@@ -1631,6 +1654,7 @@ void WritePlayerCrosshair(GameLocalContext* ctx) {
     // 中身（│   │）
     
     WriteToBuffer(sx, sy + 1, "│ " + piece + " │", ctx);
+    WriteColoredPiece(sx + 2, sy + 1, value, ctx);
     // 下辺（╚───╝）
     WriteToBuffer(sx, sy + 2, "╚───╝", ctx);
     

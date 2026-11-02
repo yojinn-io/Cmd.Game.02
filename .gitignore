@@ -423,3 +423,5 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+# CMake build output
+build/
