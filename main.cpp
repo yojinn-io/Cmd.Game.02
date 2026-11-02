@@ -1,15 +1,31 @@
 ﻿#include <stdio.h>
 #include <string>
 #include <time.h>
-#include <conio.h>
-#include <windows.h>
 #include <math.h>
 #include <vector>
+#include <climits>
+#include <cstdlib>
+#include <algorithm>
+#include <chrono>
+#include <thread>
+#include <clocale>
 
-#include <cwchar>                                       
-#include <codecvt>
-#include <wchar.h> 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <conio.h>
+#include <windows.h>
 #pragma comment(linker, "/STACK:8388608")
+#pragma execution_character_set("utf-8")
+#else
+#include <termios.h>
+#include <unistd.h>
+#include <sys/select.h>
+#endif
+
+// 文字列リテラルをUTF-8として埋め込むことを強制する（MSVCでは /utf-8 オプションでビルドすること）
+static_assert(sizeof("あ") == 4, "Source must be compiled with a UTF-8 execution charset (MSVC: /utf-8)");
 
 /*
 * ANSI Escape Sequences 参考 =>  https://gist.github.com/fnky/458719343aabd01cfb17a3a4f7296797
@@ -19,6 +35,129 @@
 */
 
 using namespace std;
+
+#pragma region "Platform"
+// OS差分をここに集約する。Windows は Console API / conio、それ以外は POSIX termios を使う。
+#ifndef _WIN32
+static struct termios originalTermios;
+static bool termiosSaved = false;
+
+void PlatformRestoreTerminal() {
+    if (termiosSaved) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &originalTermios);
+        termiosSaved = false;
+    }
+    // カーソル表示と文字色を元に戻す
+    fputs("\x1b[?25h\x1b[0m", stdout);
+    fflush(stdout);
+}
+#endif
+
+// コンソールを UTF-8 + ANSIエスケープシーケンス対応にし、キー入力を1文字ずつ読めるようにする
+void PlatformInit() {
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode = 0;
+    if (GetConsoleMode(hOut, &mode)) {
+        SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
+#else
+    if (!setlocale(LC_ALL, "C.UTF-8") && !setlocale(LC_ALL, "en_US.UTF-8")) {
+        setlocale(LC_ALL, "");
+    }
+    if (isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &originalTermios) == 0) {
+        termiosSaved = true;
+        struct termios raw = originalTermios;
+        raw.c_lflag &= ~(ICANON | ECHO);
+        raw.c_cc[VMIN] = 1;
+        raw.c_cc[VTIME] = 0;
+        tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    }
+    atexit(PlatformRestoreTerminal);
+#endif
+    // 1フレーム分の描画をまとめて出力する
+    static char outputBuffer[1 << 16];
+    setvbuf(stdout, outputBuffer, _IOFBF, sizeof(outputBuffer));
+}
+
+#ifndef _WIN32
+static bool StdinReady(int timeoutMs) {
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    struct timeval tv = { timeoutMs / 1000, (timeoutMs % 1000) * 1000 };
+    return select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0;
+}
+
+static int ReadByte() {
+    unsigned char c;
+    return read(STDIN_FILENO, &c, 1) == 1 ? c : -1;
+}
+#endif
+
+// キー入力があるかどうか（ブロックしない）
+bool KeyHit() {
+#ifdef _WIN32
+    return _kbhit() != 0;
+#else
+    return StdinReady(0);
+#endif
+}
+
+// 1キー読み取る。矢印キーはWindowsの _getch 2バイト目と同じコード（72/80/75/77）、Enterは13に揃える。
+int GetKey() {
+#ifdef _WIN32
+    int key = _getch();
+    if (key == 0 || key == 224) {
+        key = _getch();
+    }
+    return key;
+#else
+    int key = ReadByte();
+    if (key == 27) {
+        // ESC単体か、矢印キーのエスケープシーケンス（ESC [ A など）かを判別する
+        if (!StdinReady(20)) return 27;
+        int next = ReadByte();
+        if ((next == '[' || next == 'O') && StdinReady(20)) {
+            switch (ReadByte()) {
+                case 'A': return 72;
+                case 'B': return 80;
+                case 'C': return 77;
+                case 'D': return 75;
+                default: return -1;
+            }
+        }
+        return -1;
+    }
+    if (key == '\n') return 13;
+    return key;
+#endif
+}
+
+void SleepMs(int ms) {
+    this_thread::sleep_for(chrono::milliseconds(ms));
+}
+
+// 経過時間（ミリ秒、壁時計）
+double NowMs() {
+    return chrono::duration<double, milli>(chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// UTF-8文字列を1文字（コードポイント）ずつに分割する
+vector<string> SplitUtf8(const string& str) {
+    vector<string> chars;
+    for (size_t i = 0; i < str.size();) {
+        unsigned char c = str[i];
+        size_t len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 1;
+        if (i + len > str.size()) len = str.size() - i;
+        chars.push_back(str.substr(i, len));
+        i += len;
+    }
+    return chars;
+}
+#pragma endregion
 
 #pragma region "UI.Default"
 const int CONSOLE_WIDTH = 120;
@@ -125,12 +264,9 @@ string JoinCopyStr(int count, string str) {
 
 // 全角文字列の変換
 string ConvertStr(string str) {
-    wstring_convert<codecvt_utf8_utf16<wchar_t>> converterTo16;
-    wstring_convert<codecvt_utf8<wchar_t> > converterTo8;
-    wstring tmpStrTo16 = converterTo16.from_bytes(str);
     string rStr = "";
-    for (int i = 0; i < tmpStrTo16.length(); i++) {
-        rStr += converterTo8.to_bytes(tmpStrTo16[i]);
+    for (const string& c : SplitUtf8(str)) {
+        rStr += c;
     }
     return rStr;
 }
@@ -215,7 +351,7 @@ enum ConsoleColor {
 
 #pragma region "Console システム関数"
 void RunCmd(string cmd) {
-    printf(cmd.c_str());
+    fputs(cmd.c_str(), stdout);
 }
 
 void OutPrint(string str) {
@@ -227,9 +363,12 @@ void OutPrintln(string str) {
 }
 
 void ConsoleCursorVisible(bool flag0) {
+#ifdef _WIN32
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
     CONSOLE_CURSOR_INFO info = { 100, flag0 };// カーソルを非表示にする
     SetConsoleCursorInfo(hOut, &info);
+#endif
+    RunCmd(flag0 ? "\x1b[?25h" : "\x1b[?25l");
 }
 
 void ConsoleSetCursorPosition(int x, int y) {
@@ -266,7 +405,15 @@ void ConsoleClear() {
 }
 
 void ConsoleTitle(string title) {
-    SetConsoleTitleA(title.c_str());
+#ifdef _WIN32
+    // UTF-8 のタイトルを UTF-16 に変換して設定する（SetConsoleTitleA だとシステムのコードページで解釈されて文字化けする）
+    int len = MultiByteToWideChar(CP_UTF8, 0, title.c_str(), -1, NULL, 0);
+    wstring wide(len, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, title.c_str(), -1, &wide[0], len);
+    SetConsoleTitleW(wide.c_str());
+#else
+    RunCmd("\x1b]0;" + title + "\x07");
+#endif
 }
 
 #pragma endregion
@@ -296,8 +443,8 @@ struct SystemSetting {
 
 struct SystemVariable {
     int frame = 0;
-    clock_t startTime;
-    clock_t endTime;
+    double startTime; // ミリ秒
+    double endTime;   // ミリ秒
     int fps;
     double gameDelay;
 };
@@ -313,6 +460,7 @@ struct GameSystem {
 struct Points {
     Vector2 pos[AN];
     int score[AN];
+    int count; // 有効な候補点の数（AN以下）
 };
 
 struct Decision {
@@ -322,68 +470,9 @@ struct Decision {
 
 
 
-enum L_ShapeCode {
-    L_OTHER,           //0
-    L_WIN,             //100000
-    L_LOSE,            //-10000000
-    L_FLEX4,           //50000
-    L_flex4,           //-100000
-    L_BLOCK4,          //400
-    L_block4,          //-100000
-    L_FLEX3,           //400
-    L_flex3,           //-8000
-    L_BLOCK3,          //20
-    L_block3,         //-50
-    L_FLEX2,          //20
-    L_flex2,          //-50
-    L_BLOCK2,         //1
-    L_block2,         //-3
-    L_FLEX1,          //1
-    L_flex1,          //-3
-    L_SHAPE_COUNT,
-};
-
-enum M_ShapeCode {
-    M_OTHER,           //0
-    M_WIN,             //100000
-    M_LOSE,            //-10000000
-    M_FLEX3,           //50000
-    M_flex3,           //-100000
-    M_BLOCK3,          //400
-    M_block3,          //-100000
-    M_FLEX2,           //400
-    M_flex2,           //-8000
-    M_BLOCK2,          //20
-    M_block2,         //-50
-    M_FLEX1,          //20
-    M_flex1,          //-50
-    M_BLOCK1,         //1
-    M_block1,         //-3
-    M_SHAPE_COUNT,
-};
-
-enum S_ShapeCode {
-    S_OTHER,           //0
-    S_WIN,             //100000
-    S_LOSE,            //-10000000
-    S_FLEX2,           //50000
-    S_flex2,           //-100000
-    S_BLOCK2,          //400
-    S_block2,          //-100000
-    S_FLEX1,           //400
-    S_flex1,           //-8000
-    S_BLOCK1,          //20
-    S_block1,         //-50
-    S_SHAPE_COUNT,
-};
-
 typedef struct AIAnalysis {
-    // 3x3 k = 3
-    S_ShapeCode smallPatternTable[Piece::PIECE_TYPE_COUNT][Piece::PIECE_TYPE_COUNT][Piece::PIECE_TYPE_COUNT][Piece::PIECE_TYPE_COUNT];
-    // 7x7 k = 4
-    M_ShapeCode mediumPatternTable[Piece::PIECE_TYPE_COUNT][Piece::PIECE_TYPE_COUNT][Piece::PIECE_TYPE_COUNT][Piece::PIECE_TYPE_COUNT][Piece::PIECE_TYPE_COUNT];
-    // 12x12 k = 5
-    L_ShapeCode largePatternTable[Piece::PIECE_TYPE_COUNT][Piece::PIECE_TYPE_COUNT][Piece::PIECE_TYPE_COUNT][Piece::PIECE_TYPE_COUNT][Piece::PIECE_TYPE_COUNT][Piece::PIECE_TYPE_COUNT];
+    // 長さkの窓に含まれる石の数n（0〜k）ごとの重み
+    vector<long long> lineWeight;
 
     // AI 計算したの結果
     Decision decision;
@@ -393,7 +482,7 @@ typedef struct AIAnalysis {
 
 typedef struct AnalysisFuncInterface {
     void (*Init)(AnalysisFuncInterface*);
-    int (*Evaluation)(AnalysisFuncInterface*);
+    int (*Evaluation)(AnalysisFuncInterface*, const vector<vector<Piece>>&);
 
     void* localContext;
 
@@ -489,7 +578,7 @@ struct GameLocalContext {
 GameSession* CmdGameInitialize(string title, int width, int height) {
     GameSession* session = new GameSession();
     
-    SetConsoleTitleA(title.c_str());
+    ConsoleTitle(title);
     return session;
 }
 
@@ -499,33 +588,28 @@ bool CmdGameProcessMessage(GameSession* gs) {
 }
 
 void CmdGameBeginFrame(GameSession* gs) {
-    gs->sys.val.startTime = clock();
+    gs->sys.val.startTime = NowMs();
 }
 
 void CmdGameEndFrame(GameSession* gs) {
-    gs->sys.val.endTime = clock();
-    gs->sys.val.fps = (int)(gs->sys.val.frame / ((double)clock() / CLOCKS_PER_SEC));
-    double frameTime = (double)(gs->sys.val.endTime - gs->sys.val.startTime) * 1000 / CLOCKS_PER_SEC;
+    fflush(stdout);
+    static const double launchTime = NowMs();
+    gs->sys.val.endTime = NowMs();
+    double elapsedSec = (gs->sys.val.endTime - launchTime) / 1000.0;
+    gs->sys.val.fps = elapsedSec > 0 ? (int)(gs->sys.val.frame / elapsedSec) : 0;
+    double frameTime = gs->sys.val.endTime - gs->sys.val.startTime;
     if (frameTime < gs->sys.setting.frameDurationMS) {
         gs->sys.val.gameDelay = gs->sys.setting.frameDurationMS - frameTime;
-        Sleep((int)gs->sys.val.gameDelay);
+        SleepMs((int)gs->sys.val.gameDelay);
     }
 }
 
 void CmdGameFinalize(GameSession* gs) {
+    // func・シーン・イベントハンドラ表は静的に確保したグローバル変数なので delete しない
     delete gs;
-    if (func) {
-        delete func;
-    }
-    if (getCurrentScene) {
-        delete getCurrentScene;
-    }
-    if (getNextScene) {
-        delete getNextScene;
-    }
-    if (getEventHandlers) {
-        delete getEventHandlers;
-    }
+    func = NULL;
+    getCurrentScene = NULL;
+    getNextScene = NULL;
 }
 #pragma endregion
 
@@ -557,11 +641,9 @@ void RenderToScreen(GameLocalContext* ctx) {
 void WriteToBuffer(int xPos, int yPos, string characters, GameLocalContext* ctx) {
     int x = xPos;
     int y = yPos;
-    wstring_convert<codecvt_utf8_utf16<wchar_t>> converterTo16;
-    wstring_convert<codecvt_utf8<wchar_t> > converterTo8;
-    wstring wide = converterTo16.from_bytes(characters);
-    for (int i = 0; i < wide.length(); i++) {
-        string charStr = converterTo8.to_bytes(wide[i]);
+    vector<string> chars = SplitUtf8(characters);
+    for (int i = 0; i < chars.size(); i++) {
+        const string& charStr = chars[i];
         if (charStr == string(1, NEWLINE)) {
             y++;
             x = xPos;
@@ -578,12 +660,10 @@ void RenderToScreenWithColour(int xPos, int yPos, ConsoleColor colour, string ch
     int x = xPos;
     int y = yPos;
     ConsoleSetForegroundColor(colour);
-    wstring_convert<codecvt_utf8_utf16<wchar_t>> converterTo16;
-    wstring_convert<codecvt_utf8<wchar_t> > converterTo8;
-    wstring wide = converterTo16.from_bytes(characters);
+    vector<string> chars = SplitUtf8(characters);
 
-    for (int i = 0; i < wide.length(); i++) {
-        string charStr = converterTo8.to_bytes(wide[i]);
+    for (int i = 0; i < chars.size(); i++) {
+        const string& charStr = chars[i];
 
         if (charStr == string(1, NEWLINE)) {
             y++;
@@ -1006,39 +1086,21 @@ bool DetectDraw(GameLocalContext* ctx) {
 
 #pragma region "AI.アルゴリズム.設定"
 
+void MNK_Init(AnalysisFuncInterface* self);
+int MNK_Evaluation(AnalysisFuncInterface* self, const vector<vector<Piece>>& board);
 
-
-
-
-void Small_InitPatternTable(AnalysisFuncInterface* self);
-int Small_Evaluation(AnalysisFuncInterface* self);
-
-AnalysisFuncInterface SmallShapeAI = {
-    Small_InitPatternTable,
-    Small_Evaluation,
+// 盤面サイズ・勝利数に依存しない汎用MNKゲームAI
+AnalysisFuncInterface MNKShapeAI = {
+    MNK_Init,
+    MNK_Evaluation,
 };
 
-void Medium_InitPatternTable(AnalysisFuncInterface* self);
-int Medium_Evaluation(AnalysisFuncInterface* self);
+int Minimax(vector<vector<Piece>>& board, int depth, int alpha, int beta, bool isMax, GameLocalContext* ctx);
 
-AnalysisFuncInterface MediumShapeAI = {
-    Medium_InitPatternTable,
-    Medium_Evaluation,
-};
-
-void Large_InitPatternTable(AnalysisFuncInterface* self);
-int Large_Evaluation(AnalysisFuncInterface* self);
-
-AnalysisFuncInterface LargeShapeAI = {
-    Large_InitPatternTable,
-    Large_Evaluation,
-};
-
-int Minimax(vector<vector<Piece>> board, int depth, int alpha, int beta, GameLocalContext* ctx);
-
-#pragma endregion 
+#pragma endregion
 
 int main() {
+    PlatformInit();
     GameSession* session = CmdGameInitialize(AUTHOR, CONSOLE_WIDTH, CONSOLE_HEIGHT);
     ConsoleCursorVisible(false);
 
@@ -1124,8 +1186,8 @@ void Menu_Init(SceneInterface* self, GameSession* session) {
 void Menu_KeyInput(SceneInterface* self) {
     DefaultKeyInputImpl(self);
     GameLocalContext* ctx = (GameLocalContext*)(self->localContext);
-    if (_kbhit()) {
-        int key = _getch();
+    if (KeyHit()) {
+        int key = GetKey();
         if (key == W_KEY || key == UP_ARROW) {
             ctx->data.menu.selected = (ctx->data.menu.selected - 1 + ctx->data.menu.options.size()) % ctx->data.menu.options.size();
         } else if (key == S_KEY || key == DOWN_ARROW) {
@@ -1206,8 +1268,8 @@ void Config_Init(SceneInterface* self, GameSession* session) {
 void Config_KeyInput(SceneInterface* self) {
     DefaultKeyInputImpl(self);
     GameLocalContext* ctx = (GameLocalContext*)(self->localContext);
-    if (_kbhit()) {
-        int key = _getch();
+    if (KeyHit()) {
+        int key = GetKey();
         if (key == W_KEY || key == UP_ARROW) {
             ctx->data.config.selected = ((ctx->data.config.selected - 1 < 0) ? ctx->data.config.itemSize  : (ctx->data.config.selected )) - 1 % ctx->data.config.itemSize;
         } else if (key == S_KEY || key == DOWN_ARROW) {
@@ -1334,8 +1396,8 @@ void Readme_Init(SceneInterface* self, GameSession* session) {
 
 void Readme_KeyInput(SceneInterface* self) {
     GameLocalContext* ctx = (GameLocalContext*)(self->localContext);
-    if (_kbhit()) {
-        int key = _getch();
+    if (KeyHit()) {
+        int key = GetKey();
         if (key == ENTER_KEY || key == ESCAPE_KEY) {
             static SceneChangeData data;
             extern SceneInterface MenuScene;
@@ -1625,7 +1687,7 @@ void AIAction(GameLocalContext* ctx, Player* current, Player* next) {
             board.at(y).at(x) = ctx->data.game.chessData[y][x];
         }
     }
-    int a = Minimax(board, DEPTH, INT_MIN, INT_MAX, ctx);
+    Minimax(board, DEPTH, INT_MIN, INT_MAX, true, ctx);
     ctx->data.game.slavePlayer.position.y = func->analysis.decision.pos.y;
     ctx->data.game.slavePlayer.position.x = func->analysis.decision.pos.x;
     ctx->ui.selected = true;
@@ -1647,21 +1709,19 @@ void Game_Init(SceneInterface* self, GameSession* session) {
     switch (ctx->session->config.size) {
         case SMALL:
             ctx->ui.mnk = { { 3, 3 }, 3 };
-            func = &SmallShapeAI;
             break;
         case MEDIUM:
             ctx->ui.mnk = { { 7, 7 }, 4 };
-            func = &MediumShapeAI;
             break;
         case LARGE:
             ctx->ui.mnk = { { MAX_SIZE, MAX_SIZE }, 5 };
-            func = &LargeShapeAI;
             break;
     }
+    func = &MNKShapeAI;
 
     if (func) {
-        func->Init(func);
         func->localContext = ctx;
+        func->Init(func);
     }
 
     // Initialize chess data
@@ -1691,8 +1751,8 @@ void Game_Init(SceneInterface* self, GameSession* session) {
 void Game_KeyInput(SceneInterface* self) {
     DefaultKeyInputImpl(self);
     GameLocalContext* ctx = (GameLocalContext*)(self->localContext);
-    if (_kbhit()) {
-        int key = _getch();
+    if (KeyHit()) {
+        int key = GetKey();
         Vector2 inputPosi = { 0, 0 };
         if (key == W_KEY || key == UP_ARROW) {
             inputPosi.y = -1;
@@ -1764,39 +1824,40 @@ void Game_Shutdown(SceneInterface* self) {
 
 #pragma region "AI.アルゴリズム.実現"
 
-Points CollectHotZones(vector<vector<Piece>> board, GameLocalContext* ctx) {
-    Chessboard size = ctx->session->config.size;
+Points CollectHotZones(vector<vector<Piece>>& board, GameLocalContext* ctx) {
     MNKBoard mnk = ctx->ui.mnk;
     Player slave = ctx->data.game.slavePlayer;
 
     if (ctx->session->config.enableAI && func == nullptr) {
         exit(0);
-    } 
-    
+    }
+
     Points bestPoint{};
     int rows = mnk.board.y;
     int cols = mnk.board.x;
     vector<vector<bool>> localBoard(rows, vector<bool>(cols));
     vector<vector<int>> weight(rows, vector<int>(cols));
+    bool hasPiece = false;
 
     // 局所探索では、既に置かれた石の周囲8方向・3マス以内を対象に、一致する位置を探す。
     for (int y = 0; y < rows; y++) {
         for (int x = 0; x < cols; x++) {
             if (board.at(y).at(x) != Piece::NONE_PIECE) {
-                for (int k = -3; k < 3; k++) {
+                hasPiece = true;
+                for (int k = -3; k <= 3; k++) {
                     // 横向き
-                    if ((x + k < cols) && (x + k >= 0) && board.at(y).at(x + k) == Piece::NONE_PIECE) { 
-                        localBoard.at(y).at(x + k) = true; 
+                    if ((x + k < cols) && (x + k >= 0) && board.at(y).at(x + k) == Piece::NONE_PIECE) {
+                        localBoard.at(y).at(x + k) = true;
                     }
                     // 縦向き
-                    if ((y + k < rows) && (y + k) >= 0 && board.at(y + k).at(x) == Piece::NONE_PIECE) { 
-                        localBoard.at(y + k).at(x) = true; 
+                    if ((y + k < rows) && (y + k) >= 0 && board.at(y + k).at(x) == Piece::NONE_PIECE) {
+                        localBoard.at(y + k).at(x) = true;
                     }
                     // 斜向き（左上から右下）
                     if ((y + k < rows) && (y + k) >= 0 && (x + k < cols) && (x + k >= 0) && board.at(y + k).at(x + k) == Piece::NONE_PIECE) {
                         localBoard.at(y + k).at(x + k) = true;
                     }
-                    // 斜向き（左下から右上）    
+                    // 斜向き（左下から右上）
                     if ((y - k < rows) && (y - k) >= 0 && (x + k < cols) && (x + k >= 0) && board.at(y - k).at(x + k) == Piece::NONE_PIECE) {
                         localBoard.at(y - k).at(x + k) = true;
                     }
@@ -1804,700 +1865,216 @@ Points CollectHotZones(vector<vector<Piece>> board, GameLocalContext* ctx) {
             }
         }
     }
+    // 盤面に石が一つもない場合は中央を候補にする
+    if (!hasPiece) {
+        localBoard.at(rows / 2).at(cols / 2) = true;
+    }
 
     // 局所的な探索のあとで手を打つシミュレーションを行い、その結果をヒューリスティックに評価する。
     for (int y = 0; y < rows; y++) {
         for (int x = 0; x < cols; x++) {
-            weight.at(y).at(x) = INT_MIN;
             if (localBoard.at(y).at(x)) {
                 board.at(y).at(x) = slave.marker;
-                weight.at(y).at(x) = func->Evaluation(func);
+                weight.at(y).at(x) = func->Evaluation(func, board);
                 board.at(y).at(x) = Piece::NONE_PIECE;
             }
         }
     }
 
-    int w;
-    Vector2 p = { 0, 0 };
+    // 評価値の高い順に最大AN個の候補点を取り出す。候補が足りなければそこで打ち切る。
+    bestPoint.count = 0;
     for (int k = 0; k < AN; k++) {
-        w = INT_MIN;
+        int w = INT_MIN;
+        Vector2 p = { -1, -1 };
         for (int y = 0; y < rows; y++) {
             for (int x = 0; x < cols; x++) {
-                if (weight.at(y).at(x) > w) {
+                if (localBoard.at(y).at(x) && (p.x < 0 || weight.at(y).at(x) > w)) {
                     w = weight.at(y).at(x);
                     p.x = x, p.y = y;
                 }
             }
         }
+        if (p.x < 0) break; // 候補点がもう残っていない
         bestPoint.pos[k] = p, bestPoint.score[k] = w;
-        weight.at(p.y).at(p.x) = INT_MIN; //最大値を除外して、次に大きいポイントを見つける。
+        bestPoint.count++;
+        localBoard.at(p.y).at(p.x) = false; //最大値を除外して、次に大きいポイントを見つける。
     }
 
     return bestPoint;
 }
 
-void ReverseBoard(vector<vector<Piece>> board, vector<vector<Piece>>& rboard) {
+void ReverseBoard(const vector<vector<Piece>>& board, vector<vector<Piece>>& rboard) {
     for (int y = 0; y < board.size(); y++) {
         for (int x = 0; x < board.at(0).size(); x++) {
             if (board.at(y).at(x) == BLACK_PIECE) {
-                rboard.at(y).at(x) = WHITE_PIECE; 
+                rboard.at(y).at(x) = WHITE_PIECE;
             }
-            if (board.at(y).at(x) == WHITE_PIECE) { 
-                rboard.at(y).at(x) = BLACK_PIECE; 
+            if (board.at(y).at(x) == WHITE_PIECE) {
+                rboard.at(y).at(x) = BLACK_PIECE;
             }
         }
     }
 }
 
-int Minimax(vector<vector<Piece>> board, int depth, int alpha, int beta, GameLocalContext* ctx) {
+// (x, y) に置いた石で勝利条件（k個並び、または特別勝利）を満たしたかどうか
+bool IsWinningMove(const vector<vector<Piece>>& board, int x, int y, GameLocalContext* ctx) {
+    int rows = board.size();
+    int cols = board.at(0).size();
+    int k = ctx->ui.mnk.winningCount;
+    Piece marker = board.at(y).at(x);
+    const int dirs[4][2] = { { 1, 0 }, { 0, 1 }, { 1, 1 }, { 1, -1 } };
+
+    for (int d = 0; d < 4; d++) {
+        int count = 1;
+        for (int s = -1; s <= 1; s += 2) {
+            int nx = x + dirs[d][0] * s;
+            int ny = y + dirs[d][1] * s;
+            while (nx >= 0 && nx < cols && ny >= 0 && ny < rows && board.at(ny).at(nx) == marker) {
+                count++;
+                nx += dirs[d][0] * s;
+                ny += dirs[d][1] * s;
+            }
+        }
+        if (count >= k) return true;
+    }
+
+    if (ctx->session->config.specialVictory) {
+        if (board.at(0).at(0) == marker && board.at(0).at(cols - 1) == marker &&
+            board.at(rows - 1).at(0) == marker && board.at(rows - 1).at(cols - 1) == marker) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const int WIN_SCORE = INT_MAX / 2;
+
+int Minimax(vector<vector<Piece>>& board, int depth, int alpha, int beta, bool isMax, GameLocalContext* ctx) {
+    // 葉ノードでは現在の盤面をそのまま評価する
     if (depth == 0) {
-        Points p;
+        return func->Evaluation(func, board);
+    }
+
+    Points p;
+    Piece marker;
+    if (isMax) {
         p = CollectHotZones(board, ctx);
-        return p.score[0];
+        marker = ctx->data.game.slavePlayer.marker;
     } else {
-        vector<vector<Piece>> cpBoard = board;
-        if (depth % 2 == 0) { //max
-            Points p = CollectHotZones(board, ctx);
-            for (int i = 0; i < AN; i++) {
-                cpBoard.at(p.pos[i].x).at(p.pos[i].y) = ctx->data.game.slavePlayer.marker;
-                int a = Minimax(cpBoard, depth - 1, alpha, beta, ctx);
-                cpBoard.at(p.pos[i].x).at(p.pos[i].y) = Piece::NONE_PIECE;
-                if (a > alpha) {
-                    alpha = a;
-                    // もし、最大のalphaをさがしたら
-                    if (depth == DEPTH) {
-                        func->analysis.decision.pos = { p.pos[i].x, p.pos[i].y };
-                        func->analysis.decision.score = p.score[i];
+        vector<vector<Piece>> rBoard(board.size(), vector<Piece>(board.at(0).size()));
+        // 転回する
+        ReverseBoard(board, rBoard);
+        // 敵の最優なポイント
+        p = CollectHotZones(rBoard, ctx);
+        marker = ctx->data.game.masterPlayer.marker;
+    }
+
+    // 置ける場所がない = 盤面が埋まって引き分け
+    if (p.count == 0) {
+        return 0;
+    }
+
+    // ルートでは、全候補が同点でも有効な手を返せるように最初の候補を入れておく
+    if (depth == DEPTH) {
+        func->analysis.decision.pos = p.pos[0];
+        func->analysis.decision.score = p.score[0];
+    }
+
+    for (int i = 0; i < p.count; i++) {
+        int x = p.pos[i].x;
+        int y = p.pos[i].y;
+        board.at(y).at(x) = marker;
+        int a;
+        if (IsWinningMove(board, x, y, ctx)) {
+            // 早く勝つ手ほど高く、遅く負ける手ほどましに評価する
+            a = isMax ? WIN_SCORE + depth : -WIN_SCORE - depth;
+        } else {
+            a = Minimax(board, depth - 1, alpha, beta, !isMax, ctx);
+        }
+        board.at(y).at(x) = Piece::NONE_PIECE;
+
+        if (isMax) {
+            if (a > alpha) {
+                alpha = a;
+                // もし、最大のalphaをさがしたら
+                if (depth == DEPTH) {
+                    func->analysis.decision.pos = p.pos[i];
+                    func->analysis.decision.score = p.score[i];
+                }
+            }
+        } else if (a < beta) {
+            beta = a;
+        }
+        if (beta <= alpha) break; //枝刈りし
+    }
+    return isMax ? alpha : beta;
+}
+
+
+
+/////////////// MNK AI /////////////// 
+// 隣の窓に石が1つ増えるごとに重みを何倍にするか
+const long long LINE_WEIGHT_BASE = 10;
+// 相手のラインを自分のラインの何倍危険とみなすか（守備寄りにする）
+const long long DEFENSE_RATE = 2;
+
+void MNK_Init(AnalysisFuncInterface* self) {
+    GameLocalContext* ctx = (GameLocalContext*)(self->localContext);
+    int k = ctx->ui.mnk.winningCount;
+    self->analysis.lineWeight.assign(k + 1, 0);
+    long long w = 1;
+    for (int n = 1; n < k; n++) {
+        self->analysis.lineWeight[n] = w;
+        w *= LINE_WEIGHT_BASE;
+    }
+    // k個そろった窓は勝利なので、他のどの組み合わせよりも大きくする
+    self->analysis.lineWeight[k] = WIN_SCORE / 4;
+}
+
+// MNKゲーム共通の評価関数（AI = slavePlayer 視点）。
+// 盤面上の長さkの窓をすべて走査し、片方の石しか含まない窓だけを「まだ勝ちに使えるライン」として数える。
+// 両端が空いたラインはより多くの窓に含まれるので、活・死の区別は窓の数として自然に反映される。
+int MNK_Evaluation(AnalysisFuncInterface* self, const vector<vector<Piece>>& board) {
+    GameLocalContext* ctx = (GameLocalContext*)(self->localContext);
+    int rows = board.size();
+    int cols = board.at(0).size();
+    int k = ctx->ui.mnk.winningCount;
+    Piece own = ctx->data.game.slavePlayer.marker;
+    const vector<long long>& weight = self->analysis.lineWeight;
+    const int dirs[4][2] = { { 1, 0 }, { 0, 1 }, { 1, 1 }, { 1, -1 } };
+
+    long long score = 0;
+    for (int d = 0; d < 4; d++) {
+        int dx = dirs[d][0];
+        int dy = dirs[d][1];
+        for (int y = 0; y < rows; y++) {
+            for (int x = 0; x < cols; x++) {
+                int ex = x + dx * (k - 1);
+                int ey = y + dy * (k - 1);
+                if (ex < 0 || ex >= cols || ey < 0 || ey >= rows) continue;
+
+                int mine = 0, theirs = 0;
+                for (int i = 0; i < k; i++) {
+                    Piece p = board.at(y + dy * i).at(x + dx * i);
+                    if (p == own) {
+                        mine++;
+                    } else if (p != Piece::NONE_PIECE) {
+                        theirs++;
                     }
                 }
-                if (beta <= alpha) break; //枝刈りし
-            }
-            return alpha;
-        } else if (depth % 2 == 1) { //min
-            vector<vector<Piece>> rBoard(board.size(), vector<Piece>(board.at(0).size()));
-            // 転回する
-            ReverseBoard(cpBoard, rBoard);
-
-            // 敵の最優なポイント
-            Points p = CollectHotZones(rBoard, ctx);
-            for (int i = 0; i < AN; i++) {
-                cpBoard.at(p.pos[i].x).at(p.pos[i].y) = ctx->data.game.masterPlayer.marker;
-                int a = Minimax(cpBoard, depth - 1, alpha, beta, ctx);
-                cpBoard.at(p.pos[i].x).at(p.pos[i].y) = Piece::NONE_PIECE;
-                if (a < beta) {
-                    beta = a;
-                }
-                if (beta <= alpha) break; //枝刈りし
-            }
-            return beta;
-        }
-    }
-}
-
-
-
-/////////////// small AI /////////////// 
-
-void Small_InitPatternTable(AnalysisFuncInterface* self) {
-    GameLocalContext* ctx = (GameLocalContext*)(self->localContext);
-    // black win   
-    func->analysis.smallPatternTable[BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE] = S_LOSE;
-    func->analysis.smallPatternTable[BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][NONE_PIECE] = S_LOSE;
-    func->analysis.smallPatternTable[NONE_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE] = S_LOSE;
-    func->analysis.smallPatternTable[BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][WHITE_PIECE] = S_LOSE;
-    func->analysis.smallPatternTable[WHITE_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE] = S_LOSE;
-    func->analysis.smallPatternTable[INVALID_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE] = S_LOSE;
-    func->analysis.smallPatternTable[BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][INVALID_PIECE] = S_LOSE;
-    // white win
-    func->analysis.smallPatternTable[WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE] = S_WIN;
-    func->analysis.smallPatternTable[WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][NONE_PIECE] = S_WIN;
-    func->analysis.smallPatternTable[NONE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE] = S_WIN;
-    func->analysis.smallPatternTable[WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][BLACK_PIECE] = S_WIN;
-    func->analysis.smallPatternTable[BLACK_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE] = S_WIN;
-    func->analysis.smallPatternTable[INVALID_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE] = S_WIN;
-    func->analysis.smallPatternTable[WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][INVALID_PIECE] = S_WIN;
-    //
-    func->analysis.smallPatternTable[NONE_PIECE][BLACK_PIECE][BLACK_PIECE][INVALID_PIECE] = S_flex2;
-    func->analysis.smallPatternTable[INVALID_PIECE][BLACK_PIECE][BLACK_PIECE][NONE_PIECE] = S_flex2;
-    func->analysis.smallPatternTable[BLACK_PIECE][NONE_PIECE][BLACK_PIECE][INVALID_PIECE] = S_flex2;
-    func->analysis.smallPatternTable[INVALID_PIECE][BLACK_PIECE][NONE_PIECE][BLACK_PIECE] = S_flex2;
-
-    func->analysis.smallPatternTable[NONE_PIECE][WHITE_PIECE][WHITE_PIECE][INVALID_PIECE] = S_FLEX2;
-    func->analysis.smallPatternTable[INVALID_PIECE][WHITE_PIECE][WHITE_PIECE][NONE_PIECE] = S_FLEX2;
-    func->analysis.smallPatternTable[WHITE_PIECE][NONE_PIECE][WHITE_PIECE][INVALID_PIECE] = S_FLEX2;
-    func->analysis.smallPatternTable[INVALID_PIECE][WHITE_PIECE][NONE_PIECE][WHITE_PIECE] = S_FLEX2;
-
-    // black flex 1
-    func->analysis.smallPatternTable[INVALID_PIECE][BLACK_PIECE][NONE_PIECE][NONE_PIECE] = S_block1;
-    func->analysis.smallPatternTable[INVALID_PIECE][NONE_PIECE][BLACK_PIECE][NONE_PIECE] = S_flex1;
-    func->analysis.smallPatternTable[INVALID_PIECE][NONE_PIECE][NONE_PIECE][BLACK_PIECE] = S_block1;
-    func->analysis.smallPatternTable[NONE_PIECE][BLACK_PIECE][NONE_PIECE][INVALID_PIECE] = S_flex1;
-    func->analysis.smallPatternTable[NONE_PIECE][NONE_PIECE][BLACK_PIECE][INVALID_PIECE] = S_block1;
-    func->analysis.smallPatternTable[BLACK_PIECE][NONE_PIECE][NONE_PIECE][INVALID_PIECE] = S_block1;
-    // white flex 1
-    func->analysis.smallPatternTable[INVALID_PIECE][WHITE_PIECE][NONE_PIECE][NONE_PIECE] = S_BLOCK1;
-    func->analysis.smallPatternTable[INVALID_PIECE][NONE_PIECE][WHITE_PIECE][NONE_PIECE] = S_FLEX1;
-    func->analysis.smallPatternTable[INVALID_PIECE][NONE_PIECE][NONE_PIECE][WHITE_PIECE] = S_BLOCK1;
-    func->analysis.smallPatternTable[NONE_PIECE][WHITE_PIECE][NONE_PIECE][INVALID_PIECE] = S_FLEX1;
-    func->analysis.smallPatternTable[NONE_PIECE][NONE_PIECE][WHITE_PIECE][INVALID_PIECE] = S_BLOCK1;
-    func->analysis.smallPatternTable[WHITE_PIECE][NONE_PIECE][NONE_PIECE][INVALID_PIECE] = S_BLOCK1;
-
-
-    int p1, p2, p3, p4, x, y, ix, iy;
-    for (p1 = Piece::NONE_PIECE; p1 < Piece::PIECE_TYPE_COUNT; ++p1) {
-        for (p2 = NONE_PIECE; p2 < PIECE_TYPE_COUNT - 1; ++p2) {
-            for (p3 = NONE_PIECE; p3 < PIECE_TYPE_COUNT - 1; ++p3) {
-                for (p4 = NONE_PIECE; p4 < PIECE_TYPE_COUNT - 1; ++p4) {
-                        x = y = ix = iy = 0;
-
-                        if (p1 == WHITE_PIECE) { x++; } else if (p1 == BLACK_PIECE) { y++; }
-
-                        if (p2 == WHITE_PIECE) { x++; ix++; } else if (p2 == BLACK_PIECE) { y++; iy++; }
-
-                        if (p3 == WHITE_PIECE) { x++; ix++; } else if (p3 == BLACK_PIECE) { y++; iy++; }
-
-                        if (p4 == WHITE_PIECE) { x++; ix++; } else if (p4 == BLACK_PIECE) { y++; iy++; }
-
-
-
-                        if (p1 == INVALID_PIECE || p4 == INVALID_PIECE) {
-                            if (p1 == INVALID_PIECE && p4!= INVALID_PIECE) {
-                                
-                                if (ix == 0 && iy == 2) {
-                                    if (func->analysis.smallPatternTable[p1][p2][p3][p4] == S_OTHER)
-                                        func->analysis.smallPatternTable[p1][p2][p3][p4] = S_block2;
-                                }
-                                if (ix == 2 && iy == 0) {
-                                    if (func->analysis.smallPatternTable[p1][p2][p3][p4] == S_OTHER)
-                                        func->analysis.smallPatternTable[p1][p2][p3][p4] = S_BLOCK2;
-                                }
-                            } else if (p4 == Piece::INVALID_PIECE && p1 != Piece::INVALID_PIECE) {
-                               
-                                if (x == 0 && y == 2) {
-                                    if (func->analysis.smallPatternTable[p1][p2][p3][p4] == S_OTHER)
-                                        func->analysis.smallPatternTable[p1][p2][p3][p4] = S_block2;
-                                }
-                                if (x == 2 && y == 0) {
-                                    if (func->analysis.smallPatternTable[p1][p2][p3][p4] == S_OTHER)
-                                        func->analysis.smallPatternTable[p1][p2][p3][p4] = S_BLOCK2;
-                                }
-                            }
-                        } else {
-                            
-                            if ((x == 0 && y == 2) || (ix == 0 && iy == 2)) {
-                                if (func->analysis.smallPatternTable[p1][p2][p3][p4] == S_OTHER)
-                                    func->analysis.smallPatternTable[p1][p2][p3][p4] = S_block2;
-                            }
-                            if ((x == 2 && y == 0) || (ix == 2 && iy == 0)) {
-                                if (func->analysis.smallPatternTable[p1][p2][p3][p4] == S_OTHER)
-                                    func->analysis.smallPatternTable[p1][p2][p3][p4] = S_BLOCK2;
-                            }
-                        }
+                if (mine > 0 && theirs == 0) {
+                    score += weight[mine];
+                } else if (theirs > 0 && mine == 0) {
+                    score -= weight[theirs] * DEFENSE_RATE;
                 }
             }
         }
     }
 
-
+    // 勝敗が確定した局面（Minimax の WIN_SCORE）より大きくならないようにする
+    long long limit = WIN_SCORE / 2;
+    return (int)max(-limit, min(limit, score));
 }
-int Small_Evaluation(AnalysisFuncInterface* self) {
-    GameLocalContext* ctx = (GameLocalContext*)(self->localContext);
-    int rows = ctx->ui.mnk.board.y;
-    int cols = ctx->ui.mnk.board.x;
-    int k = ctx->ui.mnk.winningCount;
-    // 重みの定義
-    int weight[S_ShapeCode::S_SHAPE_COUNT] = { 0, 1000000, -10000000, 50000, -1000000, 400, -1000000, 400, -8000, 20, -50 };
-    // 4方向の棋形を記録、該当する場合はカウントを+1
-    int shapeRecord[4][S_ShapeCode::S_SHAPE_COUNT] = { { 0 } };
-    // 大盤の境界を初期化
-    vector<vector<int>> bigBoard(rows + 2, vector<int>(cols + 2));
-    for (int i = 0; i < rows + 2; i++) {
-        bigBoard.at(0).at(i) = Piece::INVALID_PIECE;
-        bigBoard.at(i).at(0) = Piece::INVALID_PIECE;
-        bigBoard.at(rows + 1).at(i) = Piece::INVALID_PIECE;
-        bigBoard.at(i).at(cols + 1) = Piece::INVALID_PIECE;
-    }
-
-    // 現在の盤面をコピー
-    for (int y = 0; y < rows; y++) {
-        for (int x = 0; x < cols; x++)
-            bigBoard.at(y + 1).at(x + 1) = ctx->data.game.chessData[y][x];
-    }
-
-    int limit = 3;
-    int _limit = limit + 1;
-    //    横向きを計算
-    for (int y = 1; y <= rows; y++) {
-        for (int x = 1; x < cols - limit; x++) {
-            int type = func->analysis.mediumPatternTable[bigBoard.at(y).at(x)][bigBoard.at(y).at(x + 1)][bigBoard.at(y).at(x + 2)][bigBoard.at(y).at(x + 3)][bigBoard.at(y).at(x + 4)];
-            shapeRecord[0][type]++;
-        }
-    }
-    //    縦向きを計算
-    for (int y = 0; y < rows - limit; y++) {
-        for (int x = 1; x <= cols; x++) {
-            int type = func->analysis.mediumPatternTable[bigBoard.at(y).at(x)][bigBoard.at(y + 1).at(x)][bigBoard.at(y + 2).at(x)][bigBoard.at(y + 3).at(x)][bigBoard.at(y + 4).at(x)];
-            shapeRecord[1][type]++;
-        }
-    }
-    //    斜向き（左下から右上）を計算
-    for (int y = rows - 1; y > _limit; y--) {
-        for (int x = 0; x < cols - limit; x++) {
-            int type = func->analysis.mediumPatternTable[bigBoard.at(y).at(x)][bigBoard.at(y - 1).at(x + 1)][bigBoard.at(y - 2).at(x + 2)][bigBoard.at(y - 3).at(x + 3)][bigBoard.at(y - 4).at(x + 4)];
-            shapeRecord[2][type]++;
-        }
-    }
-    //    斜向き（左上から右下）を計算
-    for (int y = 0; y < rows - limit; y++) {
-        for (int x = 0; x < cols - limit; x++) {
-            int type = func->analysis.mediumPatternTable[bigBoard.at(y).at(x)][bigBoard.at(y + 1).at(x + 1)][bigBoard.at(y + 2).at(x + 2)][bigBoard.at(y + 3).at(x + 3)][bigBoard.at(y + 4).at(x + 4)];
-            shapeRecord[3][type]++;
-        }
-    }
-
-    int score = 0;
-    int count = 0;
-    for (int i = 0; i < M_ShapeCode::M_SHAPE_COUNT; i++) {
-        score += weight[i] * shapeRecord[0][i] + weight[i] * shapeRecord[1][i] + weight[i] * shapeRecord[2][i] +
-            weight[i] * shapeRecord[3][i];
-        count = shapeRecord[0][i] + shapeRecord[1][i] + shapeRecord[2][i] + shapeRecord[3][i];
-        if (count > 0) {
-            string t = "Shape " + to_string(i) + ": " + to_string(count) + " × weight = " + to_string(weight[i]);
-            int i = 1;
-        }
-
-    }
-    return score;
-}
-
-/////////////// medium AI /////////////// 
-void Medium_InitPatternTable(AnalysisFuncInterface* self) {
-    GameLocalContext* ctx = (GameLocalContext*)(self->localContext);
-    // black win   
-    func->analysis.mediumPatternTable[BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE] = M_LOSE;
-    func->analysis.mediumPatternTable[BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][NONE_PIECE] = M_LOSE;
-    func->analysis.mediumPatternTable[NONE_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE] = M_LOSE;
-    func->analysis.mediumPatternTable[BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][WHITE_PIECE] = M_LOSE;
-    func->analysis.mediumPatternTable[WHITE_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE] = M_LOSE;
-    func->analysis.mediumPatternTable[INVALID_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE] = M_LOSE;
-    func->analysis.mediumPatternTable[BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][INVALID_PIECE] = M_LOSE;
-    // white win
-    func->analysis.mediumPatternTable[WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE] = M_WIN;
-    func->analysis.mediumPatternTable[WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][NONE_PIECE] = M_WIN;
-    func->analysis.mediumPatternTable[NONE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE] = M_WIN;
-    func->analysis.mediumPatternTable[WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][BLACK_PIECE] = M_WIN;
-    func->analysis.mediumPatternTable[BLACK_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE] = M_WIN;
-    func->analysis.mediumPatternTable[INVALID_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE] = M_WIN;
-    func->analysis.mediumPatternTable[WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][INVALID_PIECE] = M_WIN;
-    //
-    func->analysis.mediumPatternTable[NONE_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][NONE_PIECE] = M_flex3;
-    //
-    func->analysis.mediumPatternTable[NONE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][NONE_PIECE] = M_FLEX3;
-    //
-    func->analysis.mediumPatternTable[NONE_PIECE][BLACK_PIECE][BLACK_PIECE][NONE_PIECE][NONE_PIECE] = M_flex2;
-    func->analysis.mediumPatternTable[NONE_PIECE][BLACK_PIECE][NONE_PIECE][BLACK_PIECE][NONE_PIECE] = M_flex2;
-    func->analysis.mediumPatternTable[NONE_PIECE][NONE_PIECE][BLACK_PIECE][BLACK_PIECE][NONE_PIECE] = M_flex2;
-    //
-    func->analysis.mediumPatternTable[NONE_PIECE][WHITE_PIECE][WHITE_PIECE][NONE_PIECE][NONE_PIECE] = M_FLEX2;
-    func->analysis.mediumPatternTable[NONE_PIECE][WHITE_PIECE][NONE_PIECE][WHITE_PIECE][NONE_PIECE] = M_FLEX2;
-    func->analysis.mediumPatternTable[NONE_PIECE][NONE_PIECE][WHITE_PIECE][WHITE_PIECE][NONE_PIECE] = M_FLEX2;
-    // black flex 1
-    func->analysis.mediumPatternTable[NONE_PIECE][BLACK_PIECE][NONE_PIECE][NONE_PIECE][NONE_PIECE] = M_flex1;
-    func->analysis.mediumPatternTable[NONE_PIECE][NONE_PIECE][BLACK_PIECE][NONE_PIECE][NONE_PIECE] = M_flex1;
-    func->analysis.mediumPatternTable[NONE_PIECE][NONE_PIECE][NONE_PIECE][BLACK_PIECE][NONE_PIECE] = M_flex1;
-    // white flex 1
-    func->analysis.mediumPatternTable[NONE_PIECE][WHITE_PIECE][NONE_PIECE][NONE_PIECE][NONE_PIECE] = M_FLEX1;
-    func->analysis.mediumPatternTable[NONE_PIECE][NONE_PIECE][WHITE_PIECE][NONE_PIECE][NONE_PIECE] = M_FLEX1;
-    func->analysis.mediumPatternTable[NONE_PIECE][NONE_PIECE][NONE_PIECE][WHITE_PIECE][NONE_PIECE] = M_FLEX1;
-
-
-    int p1, p2, p3, p4, p5, x, y, ix, iy;
-    for (p1 = Piece::NONE_PIECE; p1 < Piece::PIECE_TYPE_COUNT; ++p1) {
-        for (p2 = NONE_PIECE; p2 < PIECE_TYPE_COUNT - 1; ++p2) {
-            for (p3 = NONE_PIECE; p3 < PIECE_TYPE_COUNT - 1; ++p3) {
-                for (p4 = NONE_PIECE; p4 < PIECE_TYPE_COUNT - 1; ++p4) {
-                    for (p5 = NONE_PIECE; p5 < PIECE_TYPE_COUNT - 1; ++p5) {
-                        x = y = ix = iy = 0;
-
-                        if (p1 == WHITE_PIECE) { x++; } else if (p1 == BLACK_PIECE) { y++; }
-
-                        if (p2 == WHITE_PIECE) { x++; ix++; } else if (p2 == BLACK_PIECE) { y++; iy++; }
-
-                        if (p3 == WHITE_PIECE) { x++; ix++; } else if (p3 == BLACK_PIECE) { y++; iy++; }
-
-                        if (p4 == WHITE_PIECE) { x++; ix++; } else if (p4 == BLACK_PIECE) { y++; iy++; }
-
-                        if (p5 == WHITE_PIECE) { x++; ix++; } else if (p5 == BLACK_PIECE) { y++; iy++; }
-
-
-                        if (p1 == INVALID_PIECE || p5 == INVALID_PIECE) {
-                            if (p1 == INVALID_PIECE && p5 != INVALID_PIECE) {
-                                if (ix == 0 && iy == 3) {
-                                    if (func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] == M_OTHER)
-                                        func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] = M_block3;
-                                }
-                                if (ix == 3 && iy == 0) {
-                                    if (func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] == M_OTHER)
-                                        func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] = M_BLOCK3;
-                                }
-                                if (ix == 0 && iy == 2) {
-                                    if (func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] == M_OTHER)
-                                        func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] = M_block2;
-                                }
-                                if (ix == 2 && iy == 0) {
-                                    if (func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] == M_OTHER)
-                                        func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] = M_BLOCK2;
-                                }
-                            } else if (p5 == Piece::INVALID_PIECE && p1 != Piece::INVALID_PIECE) {
-                                if (x == 0 && y == 3) {
-                                    if (func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] == M_OTHER)
-                                        func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] = M_block3;
-                                }
-                                if (x == 3 && y == 0) {
-                                    if (func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] == M_OTHER)
-                                        func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] = M_BLOCK3;
-                                }
-                                if (x == 0 && y == 2) {
-                                    if (func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] == M_OTHER)
-                                        func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] = M_block2;
-                                }
-                                if (x == 2 && y == 0) {
-                                    if (func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] == M_OTHER)
-                                        func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] = M_BLOCK2;
-                                }
-                            }
-                        } else {
-                            if ((x == 0 && y == 3) || (ix == 0 && iy == 3)) {
-                                if (func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] == M_OTHER)
-                                    func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] = M_block3;
-                            }
-                            if ((x == 3 && y == 0) || (ix == 3 && iy == 0)) {
-                                if (func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] == M_OTHER)
-                                    func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] = M_BLOCK3;
-                            }
-                            if ((x == 0 && y == 2) || (ix == 0 && iy == 2)) {
-                                if (func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] == M_OTHER)
-                                    func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] = M_block2;
-                            }
-                            if ((x == 2 && y == 0) || (ix == 2 && iy == 0)) {
-                                if (func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] == M_OTHER)
-                                    func->analysis.mediumPatternTable[p1][p2][p3][p4][p5] = M_BLOCK2;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-int Medium_Evaluation(AnalysisFuncInterface* self) {
-    GameLocalContext* ctx = (GameLocalContext*)(self->localContext);
-    int rows = ctx->ui.mnk.board.y;
-    int cols = ctx->ui.mnk.board.x;
-    int k = ctx->ui.mnk.winningCount;
-    // 重みの定義
-    int weight[M_ShapeCode::M_SHAPE_COUNT] = { 0, 1000000, -10000000, 50000, -1000000, 400, -1000000, 400, -8000, 20, -50, 20, -50, 1, -3 };
-    // 4方向の棋形を記録、該当する場合はカウントを+1
-    int shapeRecord[4][M_ShapeCode::M_SHAPE_COUNT] = { { 0 } };
-    // 大盤の境界を初期化
-    vector<vector<int>> bigBoard(rows + 2, vector<int>(cols + 2));
-    for (int i = 0; i < rows + 2; i++) {
-        bigBoard.at(0).at(i) = Piece::INVALID_PIECE;
-        bigBoard.at(i).at(0) = Piece::INVALID_PIECE;
-        bigBoard.at(rows + 1).at(i) = Piece::INVALID_PIECE;
-        bigBoard.at(i).at(cols + 1) = Piece::INVALID_PIECE;
-    }
-
-    // 現在の盤面をコピー
-    for (int y = 0; y < rows; y++) {
-        for (int x = 0; x < cols; x++)
-            bigBoard.at(y + 1).at(x + 1) = ctx->data.game.chessData[y][x];
-    }
-
-    int limit = 3;
-    int _limit = limit + 1;
-    //    横向きを計算
-    for (int y = 1; y <= rows; y++) {
-        for (int x = 1; x < cols - limit; x++) {
-            int type = func->analysis.mediumPatternTable[bigBoard.at(y).at(x)][bigBoard.at(y).at(x + 1)][bigBoard.at(y).at(x + 2)][bigBoard.at(y).at(x + 3)][bigBoard.at(y).at(x + 4)];
-            shapeRecord[0][type]++;
-        }
-    }
-    //    縦向きを計算
-    for (int y = 0; y < rows - limit; y++) {
-        for (int x = 1; x <= cols; x++) {
-            int type = func->analysis.mediumPatternTable[bigBoard.at(y).at(x)][bigBoard.at(y + 1).at(x)][bigBoard.at(y + 2).at(x)][bigBoard.at(y + 3).at(x)][bigBoard.at(y + 4).at(x)];
-            shapeRecord[1][type]++;
-        }
-    }
-    //    斜向き（左下から右上）を計算
-    for (int y = rows - 1; y > _limit; y--) {
-        for (int x = 0; x < cols - limit; x++) {
-            int type = func->analysis.mediumPatternTable[bigBoard.at(y).at(x)][bigBoard.at(y - 1).at(x + 1)][bigBoard.at(y - 2).at(x + 2)][bigBoard.at(y - 3).at(x + 3)][bigBoard.at(y - 4).at(x + 4)];
-            shapeRecord[2][type]++;
-        }
-    }
-    //    斜向き（左上から右下）を計算
-    for (int y = 0; y < rows - limit; y++) {
-        for (int x = 0; x < cols - limit; x++) {
-            int type = func->analysis.mediumPatternTable[bigBoard.at(y).at(x)][bigBoard.at(y + 1).at(x + 1)][bigBoard.at(y + 2).at(x + 2)][bigBoard.at(y + 3).at(x + 3)][bigBoard.at(y + 4).at(x + 4)];
-            shapeRecord[3][type]++;
-        }
-    }
-
-    int score = 0;
-    int count = 0;
-    for (int i = 0; i < M_ShapeCode::M_SHAPE_COUNT; i++) {
-        score += weight[i] * shapeRecord[0][i] + weight[i] * shapeRecord[1][i] + weight[i] * shapeRecord[2][i] +
-            weight[i] * shapeRecord[3][i];
-        count = shapeRecord[0][i] + shapeRecord[1][i] + shapeRecord[2][i] + shapeRecord[3][i];
-        if (count > 0) {
-            string t = "Shape " + to_string(i) + ": " + to_string(count) + " × weight = " + to_string(weight[i]);
-            int i = 1;
-        }
-
-    }
-    return score;
-}
-
-/////////////// large AI /////////////// 
-
-void Large_InitPatternTable(AnalysisFuncInterface* self) {
-    GameLocalContext* ctx = (GameLocalContext*)(self->localContext);
-    // black win   
-    func->analysis.largePatternTable[BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE] = L_LOSE;
-    func->analysis.largePatternTable[BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][NONE_PIECE] = L_LOSE;
-    func->analysis.largePatternTable[NONE_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE] = L_LOSE;
-    func->analysis.largePatternTable[BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][WHITE_PIECE] = L_LOSE;
-    func->analysis.largePatternTable[WHITE_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE] = L_LOSE;
-    func->analysis.largePatternTable[INVALID_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE] = L_LOSE;
-    func->analysis.largePatternTable[BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][INVALID_PIECE] = L_LOSE;
-    // white win
-    func->analysis.largePatternTable[WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE] = L_WIN;
-    func->analysis.largePatternTable[WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][NONE_PIECE] = L_WIN;
-    func->analysis.largePatternTable[NONE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE] = L_WIN;
-    func->analysis.largePatternTable[WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][BLACK_PIECE] = L_WIN;
-    func->analysis.largePatternTable[BLACK_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE] = L_WIN;
-    func->analysis.largePatternTable[INVALID_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE] = L_WIN;
-    func->analysis.largePatternTable[WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][INVALID_PIECE] = L_WIN;
-    //
-    func->analysis.largePatternTable[NONE_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][NONE_PIECE] = L_flex4;
-    //
-    func->analysis.largePatternTable[NONE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][NONE_PIECE] = L_FLEX4;
-    //
-    func->analysis.largePatternTable[NONE_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][NONE_PIECE][NONE_PIECE] = L_flex3;
-    func->analysis.largePatternTable[NONE_PIECE][NONE_PIECE][BLACK_PIECE][BLACK_PIECE][BLACK_PIECE][NONE_PIECE] = L_flex3;
-    func->analysis.largePatternTable[NONE_PIECE][BLACK_PIECE][NONE_PIECE][BLACK_PIECE][BLACK_PIECE][NONE_PIECE] = L_flex3;
-    func->analysis.largePatternTable[NONE_PIECE][BLACK_PIECE][BLACK_PIECE][NONE_PIECE][BLACK_PIECE][NONE_PIECE] = L_flex3;
-    //
-    func->analysis.largePatternTable[NONE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][NONE_PIECE][NONE_PIECE] = L_FLEX3;
-    func->analysis.largePatternTable[NONE_PIECE][NONE_PIECE][WHITE_PIECE][WHITE_PIECE][WHITE_PIECE][NONE_PIECE] = L_FLEX3;
-    func->analysis.largePatternTable[NONE_PIECE][WHITE_PIECE][NONE_PIECE][WHITE_PIECE][WHITE_PIECE][NONE_PIECE] = L_FLEX3;
-    func->analysis.largePatternTable[NONE_PIECE][WHITE_PIECE][WHITE_PIECE][NONE_PIECE][WHITE_PIECE][NONE_PIECE] = L_FLEX3;
-    //
-    func->analysis.largePatternTable[NONE_PIECE][BLACK_PIECE][BLACK_PIECE][NONE_PIECE][NONE_PIECE][NONE_PIECE] = L_flex2;
-    func->analysis.largePatternTable[NONE_PIECE][BLACK_PIECE][NONE_PIECE][BLACK_PIECE][NONE_PIECE][NONE_PIECE] = L_flex2;
-    func->analysis.largePatternTable[NONE_PIECE][BLACK_PIECE][NONE_PIECE][NONE_PIECE][BLACK_PIECE][NONE_PIECE] = L_flex2;
-    func->analysis.largePatternTable[NONE_PIECE][NONE_PIECE][BLACK_PIECE][BLACK_PIECE][NONE_PIECE][NONE_PIECE] = L_flex2;
-    func->analysis.largePatternTable[NONE_PIECE][NONE_PIECE][BLACK_PIECE][NONE_PIECE][BLACK_PIECE][NONE_PIECE] = L_flex2;
-    func->analysis.largePatternTable[NONE_PIECE][NONE_PIECE][NONE_PIECE][BLACK_PIECE][BLACK_PIECE][NONE_PIECE] = L_flex2;
-    //
-    func->analysis.largePatternTable[NONE_PIECE][WHITE_PIECE][WHITE_PIECE][NONE_PIECE][NONE_PIECE][NONE_PIECE] = L_FLEX2;
-    func->analysis.largePatternTable[NONE_PIECE][WHITE_PIECE][NONE_PIECE][WHITE_PIECE][NONE_PIECE][NONE_PIECE] = L_FLEX2;
-    func->analysis.largePatternTable[NONE_PIECE][WHITE_PIECE][NONE_PIECE][NONE_PIECE][WHITE_PIECE][NONE_PIECE] = L_FLEX2;
-    func->analysis.largePatternTable[NONE_PIECE][NONE_PIECE][WHITE_PIECE][WHITE_PIECE][NONE_PIECE][NONE_PIECE] = L_FLEX2;
-    func->analysis.largePatternTable[NONE_PIECE][NONE_PIECE][WHITE_PIECE][NONE_PIECE][WHITE_PIECE][NONE_PIECE] = L_FLEX2;
-    func->analysis.largePatternTable[NONE_PIECE][NONE_PIECE][NONE_PIECE][WHITE_PIECE][WHITE_PIECE][NONE_PIECE] = L_FLEX2;
-    // black flex 1
-    func->analysis.largePatternTable[NONE_PIECE][BLACK_PIECE][NONE_PIECE][NONE_PIECE][NONE_PIECE][NONE_PIECE] = L_flex1;
-    func->analysis.largePatternTable[NONE_PIECE][NONE_PIECE][BLACK_PIECE][NONE_PIECE][NONE_PIECE][NONE_PIECE] = L_flex1;
-    func->analysis.largePatternTable[NONE_PIECE][NONE_PIECE][NONE_PIECE][BLACK_PIECE][NONE_PIECE][NONE_PIECE] = L_flex1;
-    func->analysis.largePatternTable[NONE_PIECE][NONE_PIECE][NONE_PIECE][NONE_PIECE][BLACK_PIECE][NONE_PIECE] = L_flex1;
-    // white flex 1
-    func->analysis.largePatternTable[NONE_PIECE][WHITE_PIECE][NONE_PIECE][NONE_PIECE][NONE_PIECE][NONE_PIECE] = L_FLEX1;
-    func->analysis.largePatternTable[NONE_PIECE][NONE_PIECE][WHITE_PIECE][NONE_PIECE][NONE_PIECE][NONE_PIECE] = L_FLEX1;
-    func->analysis.largePatternTable[NONE_PIECE][NONE_PIECE][NONE_PIECE][WHITE_PIECE][NONE_PIECE][NONE_PIECE] = L_FLEX1;
-    func->analysis.largePatternTable[NONE_PIECE][NONE_PIECE][NONE_PIECE][NONE_PIECE][WHITE_PIECE][NONE_PIECE] = L_FLEX1;
-
-    int p1, p2, p3, p4, p5, p6, x, y, ix, iy;
-    for (p1 = Piece::NONE_PIECE; p1 < Piece::PIECE_TYPE_COUNT; ++p1) {
-        for (p2 = NONE_PIECE; p2 < PIECE_TYPE_COUNT - 1; ++p2) {
-            for (p3 = NONE_PIECE; p3 < PIECE_TYPE_COUNT - 1; ++p3) {
-                for (p4 = NONE_PIECE; p4 < PIECE_TYPE_COUNT - 1; ++p4) {
-                    for (p5 = NONE_PIECE; p5 < PIECE_TYPE_COUNT - 1; ++p5) {
-                        for (p6 = NONE_PIECE; p6 < PIECE_TYPE_COUNT; ++p6) {
-                            x = y = ix = iy = 0;
-
-                            if (p1 == WHITE_PIECE) { x++; } else if (p1 == BLACK_PIECE) { y++; }
-
-                            if (p2 == WHITE_PIECE) { x++; ix++; } else if (p2 == BLACK_PIECE) { y++; iy++; }
-
-                            if (p3 == WHITE_PIECE) { x++; ix++; } else if (p3 == BLACK_PIECE) { y++; iy++; }
-
-                            if (p4 == WHITE_PIECE) { x++; ix++; } else if (p4 == BLACK_PIECE) { y++; iy++; }
-
-                            if (p5 == WHITE_PIECE) { x++; ix++; } else if (p5 == BLACK_PIECE) { y++; iy++; }
-
-                            if (p6 == WHITE_PIECE) { ix++; } else if (p6 == BLACK_PIECE) { iy++; }
-
-                            if (p1 == INVALID_PIECE || p6 == INVALID_PIECE) {
-                                if (p1 == INVALID_PIECE && p6 != INVALID_PIECE) {
-                                    if (ix == 0 && iy == 4) {
-                                        if (func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] == L_OTHER)
-                                            func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] = L_block4;
-                                    }
-                                    if (ix == 4 && iy == 0) {
-                                        if (func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] == L_OTHER)
-                                            func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] = L_BLOCK4;
-                                    }
-                                    if (ix == 0 && iy == 3) {
-                                        if (func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] == L_OTHER)
-                                            func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] = L_block3;
-                                    }
-                                    if (ix == 3 && iy == 0) {
-                                        if (func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] == L_OTHER)
-                                            func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] = L_BLOCK3;
-                                    }
-                                    if (ix == 0 && iy == 2) {
-                                        if (func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] == L_OTHER)
-                                            func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] = L_block2;
-                                    }
-                                    if (ix == 2 && iy == 0) {
-                                        if (func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] == L_OTHER)
-                                            func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] = L_BLOCK2;
-                                    }
-                                } else if (p6 == Piece::INVALID_PIECE && p1 != Piece::INVALID_PIECE) {
-                                    if (x == 0 && y == 4) {
-                                        if (func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] == L_OTHER)
-                                            func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] = L_block4;
-                                    }
-                                    if (x == 4 && y == 0) {
-                                        if (func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] == L_OTHER)
-                                            func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] = L_BLOCK4;
-                                    }
-                                    if (x == 0 && y == 3) {
-                                        if (func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] == L_OTHER)
-                                            func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] = L_block3;
-                                    }
-                                    if (x == 3 && y == 0) {
-                                        if (func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] == L_OTHER)
-                                            func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] = L_BLOCK3;
-                                    }
-                                    if (x == 0 && y == 2) {
-                                        if (func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] == L_OTHER)
-                                            func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] = L_block2;
-                                    }
-                                    if (x == 2 && y == 0) {
-                                        if (func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] == L_OTHER)
-                                            func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] = L_BLOCK2;
-                                    }
-                                }
-                            } else {
-                                if ((x == 0 && y == 4) || (ix == 0 && iy == 4)) {
-                                    if (func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] == L_OTHER)
-                                        func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] = L_block4;
-                                }
-                                if ((x == 4 && y == 0) || (ix == 4 && iy == 0)) {
-                                    if (func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] == L_OTHER)
-                                        func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] = L_BLOCK4;
-                                }
-                                if ((x == 0 && y == 3) || (ix == 0 && iy == 3)) {
-                                    if (func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] == L_OTHER)
-                                        func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] = L_block3;
-                                }
-                                if ((x == 3 && y == 0) || (ix == 3 && iy == 0)) {
-                                    if (func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] == L_OTHER)
-                                        func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] = L_BLOCK3;
-                                }
-                                if ((x == 0 && y == 2) || (ix == 0 && iy == 2)) {
-                                    if (func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] == L_OTHER)
-                                        func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] = L_block2;
-                                }
-                                if ((x == 2 && y == 0) || (ix == 2 && iy == 0)) {
-                                    if (func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] == L_OTHER)
-                                        func->analysis.largePatternTable[p1][p2][p3][p4][p5][p6] = L_BLOCK2;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-
-int Large_Evaluation(AnalysisFuncInterface* self) {
-    GameLocalContext* ctx = (GameLocalContext*)(self->localContext);
-    int rows = ctx->ui.mnk.board.y;
-    int cols = ctx->ui.mnk.board.x;
-    int k = ctx->ui.mnk.winningCount;
-    // 重みの定義
-    int weight[L_ShapeCode::L_SHAPE_COUNT] = { 0, 1000000, -10000000, 50000, -1000000, 400, -1000000, 400, -8000, 20, -50, 20, -50, 1, -3, 1, -3 };
-    // 4方向の棋形を記録、該当する場合はカウントを+1
-    int shapeRecord[4][L_ShapeCode::L_SHAPE_COUNT] = { { 0 } };
-    // 大盤の境界を初期化
-    vector<vector<int>> bigBoard(rows + 2, vector<int>(cols + 2));
-    for (int i = 0; i < rows + 2; i++) {
-        bigBoard.at(0).at(i) = Piece::INVALID_PIECE;
-        bigBoard.at(i).at(0) = Piece::INVALID_PIECE;
-        bigBoard.at(rows + 1).at(i) = Piece::INVALID_PIECE;
-        bigBoard.at(i).at(cols + 1) = Piece::INVALID_PIECE;
-    }
-
-    // 現在の盤面をコピー
-    for (int y = 0; y < rows; y++) {
-        for (int x = 0; x < cols; x++)
-            bigBoard.at(y + 1).at(x + 1) = ctx->data.game.chessData[y][x];
-    }
-
-    int limit = 3;
-    int _limit = limit + 1;
-    //    横向きを計算
-    for (int y = 1; y <= rows; y++) {
-        for (int x = 1; x < cols - limit; x++) {
-            int type = func->analysis.largePatternTable[bigBoard.at(y).at(x)][bigBoard.at(y).at(x + 1)][bigBoard.at(y).at(x + 2)][bigBoard.at(y).at(x + 3)][bigBoard.at(y).at(x + 4)][bigBoard.at(y).at(x + 5)];
-            shapeRecord[0][type]++;
-        }
-    }
-    //    縦向きを計算
-    for (int y = 0; y < rows - limit; y++) {
-        for (int x = 1; x <= cols; x++) {
-            int type = func->analysis.largePatternTable[bigBoard.at(y).at(x)][bigBoard.at(y + 1).at(x)][bigBoard.at(y + 2).at(x)][bigBoard.at(y + 3).at(x)][bigBoard.at(y + 4).at(x)][bigBoard.at(y + 5).at(x)];
-            shapeRecord[1][type]++;
-        }
-    }
-    //    斜向き（左下から右上）を計算
-    for (int y = rows - 1; y > _limit; y--) {
-        for (int x = 0; x < cols - limit; x++) {
-            int type = func->analysis.largePatternTable[bigBoard.at(y).at(x)][bigBoard.at(y - 1).at(x + 1)][bigBoard.at(y - 2).at(x + 2)][bigBoard.at(y - 3).at(x + 3)][bigBoard.at(y - 4).at(x + 4)][bigBoard.at(y - 5).at(x + 5)];
-            shapeRecord[2][type]++;
-        }
-    }
-    //    斜向き（左上から右下）を計算
-    for (int y = 0; y < rows - limit; y++) {
-        for (int x = 0; x < cols - limit; x++) {
-            int type = func->analysis.largePatternTable[bigBoard.at(y).at(x)][bigBoard.at(y + 1).at(x + 1)][bigBoard.at(y + 2).at(x + 2)][bigBoard.at(y + 3).at(x + 3)][bigBoard.at(y + 4).at(x + 4)][bigBoard.at(y + 5).at(x + 5)];
-            shapeRecord[3][type]++;
-        }
-    }
-
-    int score = 0;
-    int count = 0;
-    for (int i = 0; i < L_ShapeCode::L_SHAPE_COUNT; i++) {
-        score += weight[i] * shapeRecord[0][i] + weight[i] * shapeRecord[1][i] + weight[i] * shapeRecord[2][i] +
-            weight[i] * shapeRecord[3][i];
-        count = shapeRecord[0][i] + shapeRecord[1][i] + shapeRecord[2][i] + shapeRecord[3][i];
-        if (count > 0) {
-            string t = "Shape " + to_string(i) + ": " + to_string(count) + " × weight = " + to_string(weight[i]);
-            int i = 1;
-        }
-
-    }
-    return score;
-}
-
-
 
 #pragma endregion
 
