@@ -271,6 +271,20 @@ string ConvertStr(string str) {
     return rStr;
 }
 
+// 1文字（UTF-8）が端末上で2マス分の幅を取る全角文字かどうか（East Asian Wide / Fullwidth）
+bool IsWideChar(const string& ch) {
+    if (ch.size() < 3) return false;
+    unsigned int cp = (unsigned char)ch[0] & (ch.size() == 3 ? 0x0F : 0x07);
+    for (size_t i = 1; i < ch.size(); i++) {
+        cp = (cp << 6) | ((unsigned char)ch[i] & 0x3F);
+    }
+    return (cp >= 0x1100 && cp <= 0x115F) || (cp >= 0x2E80 && cp <= 0x303E) || (cp >= 0x3041 && cp <= 0x33FF) ||
+        (cp >= 0x3400 && cp <= 0x4DBF) || (cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0xA000 && cp <= 0xA4CF) ||
+        (cp >= 0xAC00 && cp <= 0xD7A3) || (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0xFE30 && cp <= 0xFE4F) ||
+        (cp >= 0xFF00 && cp <= 0xFF60) || (cp >= 0xFFE0 && cp <= 0xFFE6) || (cp >= 0x1F300 && cp <= 0x1F64F) ||
+        (cp >= 0x1F900 && cp <= 0x1F9FF) || (cp >= 0x20000 && cp <= 0x3FFFD);
+}
+
 
 #pragma endregion
 
@@ -391,17 +405,9 @@ void ConsoleResetColor() {
 }
 
 void ConsoleClear() {
-    RunCmd("\x1b[H");
-    for (int i = 0; i < CONSOLE_HEIGHT ; ++i) {
-        string clear = string(CONSOLE_WIDTH, SPACE);
-        if (i == CONSOLE_HEIGHT - 1) {
-            OutPrint(clear);
-        } else {
-            OutPrintln(clear);
-        }
-    }
-    // 最後にカーソルを先頭に戻す（ANSIが使える場合）
-    RunCmd("\x1b[H");
+    // 画面全体を消去してカーソルを先頭に戻す。
+    // 幅ぴったりの空白行を出力する方法だと、端末によっては自動改行が入って画面がスクロールする。
+    RunCmd("\x1b[2J\x1b[H");
 }
 
 void ConsoleTitle(string title) {
@@ -604,7 +610,18 @@ void CmdGameEndFrame(GameSession* gs) {
     }
 }
 
+void UnregisterEventHandler(EventType type, EventHandler handler);
+void HandleSceneChange(Event* e);
+
 void CmdGameFinalize(GameSession* gs) {
+    // 現在のシーンのローカルコンテキストは session を参照しているので、session より先に解放する
+    if (getCurrentScene && getCurrentScene->Shutdown) {
+        getCurrentScene->Shutdown(getCurrentScene);
+    }
+    UnregisterEventHandler(EventType::SYS_SCENE_CHANGE, HandleSceneChange);
+    ConsoleCursorVisible(true);
+    fflush(stdout);
+
     // func・シーン・イベントハンドラ表は静的に確保したグローバル変数なので delete しない
     delete gs;
     func = NULL;
@@ -614,6 +631,16 @@ void CmdGameFinalize(GameSession* gs) {
 #pragma endregion
 
 #pragma region "描画"
+// 画面バッファの全マスを空白にする。
+// 空文字列のマスは「全角文字の右半分」を表し、描画時には何も出力しない。
+void ClearScreenBuffer(GameLocalContext* ctx) {
+    for (int x = 0; x < CONSOLE_WIDTH - 1; x++) {
+        for (int y = 0; y < CONSOLE_HEIGHT; y++) {
+            ctx->ui.screenBuffer[x][y] = string(1, SPACE);
+        }
+    }
+}
+
 void RenderToScreen(GameLocalContext* ctx) {
     for (int y = 0; y < ctx->session->sys.setting.screenHeight; y++) {
         for (int x = 0; x < ctx->session->sys.setting.screenWidth; x++) {
@@ -631,9 +658,8 @@ void RenderToScreen(GameLocalContext* ctx) {
     OutPrint(ctx->ui.screenGraphic);
 
 
-    for (int i = 0; i < CONSOLE_WIDTH - 1; i++) {
-        ctx->ui.screenBuffer[i]->clear();
-    }
+    // 次のフレームに前の描画内容が残らないよう、バッファ全体をクリアする
+    ClearScreenBuffer(ctx);
 
     ctx->ui.screenGraphic.clear(); // Clear the screen graphic buffer
 }
@@ -641,18 +667,34 @@ void RenderToScreen(GameLocalContext* ctx) {
 void WriteToBuffer(int xPos, int yPos, string characters, GameLocalContext* ctx) {
     int x = xPos;
     int y = yPos;
+    int screenWidth = ctx->session->sys.setting.screenWidth;
+    int screenHeight = ctx->session->sys.setting.screenHeight;
     vector<string> chars = SplitUtf8(characters);
     for (int i = 0; i < chars.size(); i++) {
         const string& charStr = chars[i];
         if (charStr == string(1, NEWLINE)) {
             y++;
             x = xPos;
-        } else if (x < 0 || y < 0 || x >= ctx->session->sys.setting.screenWidth || y >= ctx->session->sys.setting.screenHeight) {
-            x++;
-        } else {
-            ctx->ui.screenBuffer[x][y] = charStr;
-            x++;
+            continue;
         }
+        // 全角文字は2マス使う（右半分のマスは空文字列にしておく）
+        int width = IsWideChar(charStr) ? 2 : 1;
+        if (x < 0 || y < 0 || x + width > screenWidth || y >= screenHeight) {
+            x += width;
+            continue;
+        }
+        // 既存の全角文字の片側だけを上書きする場合は、残った半分を空白に戻す
+        if (ctx->ui.screenBuffer[x][y].empty() && x > 0) {
+            ctx->ui.screenBuffer[x - 1][y] = string(1, SPACE);
+        }
+        if (x + width < screenWidth && ctx->ui.screenBuffer[x + width][y].empty()) {
+            ctx->ui.screenBuffer[x + width][y] = string(1, SPACE);
+        }
+        ctx->ui.screenBuffer[x][y] = charStr;
+        if (width == 2) {
+            ctx->ui.screenBuffer[x + 1][y] = "";
+        }
+        x += width;
     }
 }
 
@@ -753,6 +795,13 @@ void DispatchEvent(Event* event) {
             getEventHandlers[event->type][i](event);
         }
     }
+}
+
+// イベントはハンドラが同期的に処理するので、スタック上に作れば十分（new すると毎回リークする）。
+// ハンドラは Event や data のポインタを呼び出し後まで保持してはいけない。
+void DispatchEvent(EventType type, void* data) {
+    Event event = { type, data };
+    DispatchEvent(&event);
 }
 
 #pragma endregion
@@ -899,146 +948,47 @@ void SetCurrentPlayerWinCount(GameLocalContext* ctx, Player* p) {
     ctx->session->data.preWin = p->role; // 勝利したプレイヤーを記録
 }
 
-bool DetectBoardHorizontal(GameLocalContext* ctx, Player* p, Piece chessData[MAX_SIZE][MAX_SIZE]) {
+// p->position の石を通る (dx, dy) 方向のラインで、同じ石が winningCount 個以上連続しているかを判定する
+bool DetectBoardLine(GameLocalContext* ctx, Player* p, Piece chessData[MAX_SIZE][MAX_SIZE], int dx, int dy) {
     int winCount = ctx->ui.mnk.winningCount;
+    int row = ctx->ui.mnk.board.y;
     int col = ctx->ui.mnk.board.x;
-    int initX = p->position.x - winCount + 1 < 0 ? 0 : p->position.x - winCount + 1;
-    int finalX = p->position.x + winCount - 1 >= col ? col - 1 : p->position.x + winCount - 1;
-    bool isWin = true;
-    for (int x = initX; x <= finalX; x++) {
-        if (x + winCount - 1 >= col) {
-            break;
-        }
-
-        isWin = true;
-        for (int k = x; k < (x + winCount - 1); k++) {
-            if (chessData[p->position.y][k] == p->marker) {
-                if (chessData[p->position.y][k] != chessData[p->position.y][k + 1]) {
-                    isWin = false;
-                    break;
-                }
-            } else {
-                isWin = false;
-            }
-        }
-        if (isWin) {
-            break;
-        }
+    int px = p->position.x;
+    int py = p->position.y;
+    if (chessData[py][px] != p->marker) {
+        return false;
     }
 
-    return isWin;
+    int count = 1;
+    // 正方向と逆方向に、盤面の端か別の石に当たるまで数える
+    for (int s = -1; s <= 1; s += 2) {
+        int x = px + dx * s;
+        int y = py + dy * s;
+        while (x >= 0 && x < col && y >= 0 && y < row && chessData[y][x] == p->marker) {
+            count++;
+            x += dx * s;
+            y += dy * s;
+        }
+    }
+    return count >= winCount;
+}
+
+bool DetectBoardHorizontal(GameLocalContext* ctx, Player* p, Piece chessData[MAX_SIZE][MAX_SIZE]) {
+    return DetectBoardLine(ctx, p, chessData, 1, 0);
 }
 
 bool DetectBoardVertical(GameLocalContext* ctx, Player* p, Piece chessData[MAX_SIZE][MAX_SIZE]) {
-   
-    int winCount = ctx->ui.mnk.winningCount;
-    int row = ctx->ui.mnk.board.y;
-    int initY = p->position.y - winCount + 1 < 0 ? 0 : p->position.y - winCount + 1;
-    int finalY = p->position.y + winCount - 1 >= row ? row - 1 : p->position.y + winCount - 1;
-    bool isWin = true;
-
-    for (int y = initY; y <= finalY; y++) {
-        if (y + winCount - 1 >= row) {
-            break;
-        }
-        isWin = true;
-        for (int k = y; k < (y + winCount - 1); k++) {
-            if (chessData[k][p->position.x] == p->marker) {
-                if (chessData[k][p->position.x] != chessData[k + 1][p->position.x]) {
-                    isWin = false;
-                    break;
-                }
-            } else {
-                isWin = false;
-            }
-        }
-        if (isWin) {
-            break;
-        }
-    }
-    return isWin;
+    return DetectBoardLine(ctx, p, chessData, 0, 1);
 }
+
+// 左下から右上
 bool DetectBoardDiagonalRight(GameLocalContext* ctx, Player* p, Piece chessData[MAX_SIZE][MAX_SIZE]) {
-   
-    int initY, initX, finalY, finalX;
-    int winCount = ctx->ui.mnk.winningCount;
-    int row = ctx->ui.mnk.board.y;
-    int col = ctx->ui.mnk.board.x;
-    if (p->position.y + p->position.x >= row) {
-        initY = p->position.y + winCount - 1 >= row ? row - 1 : p->position.y + winCount - 1;
-        initX = p->position.x - (initY - p->position.y);
-
-        finalX = p->position.x + winCount - 1 >= col ? col - 1 : p->position.x + winCount - 1;
-        finalY = initY - (finalX - p->position.x);
-    } else {
-        initX = p->position.x - winCount + 1 < 0 ? 0 : p->position.x - winCount + 1;
-        initY = p->position.y + (p->position.x - initX);
-
-        finalY = p->position.y - winCount + 1 < 0 ? 0 : p->position.y - winCount + 1;
-        finalX = p->position.x + (p->position.y - finalY);
-    }
-    bool isWin = false;
-    for (int x = initX, y = initY; y >= finalY; x++, y--) {
-        if (y - winCount + 1 < 0) {
-            break;
-        }
-        isWin = true;
-        for (int l = x, k = y; k > y - winCount + 1; k--, l++) {
-            if (chessData[k][l] == p->marker) {
-                if (chessData[k][l] != chessData[k - 1][l + 1]) {
-                    isWin = false;
-                    break;
-                }
-            } else {
-                isWin = false;
-            }
-        }
-        if (isWin) {
-            break;
-        }
-    }
-    return isWin;
+    return DetectBoardLine(ctx, p, chessData, 1, -1);
 }
+
+// 左上から右下
 bool DetectBoardDiagonalLeft(GameLocalContext* ctx, Player* p, Piece chessData[MAX_SIZE][MAX_SIZE]) {
-    int initY, initX, finalY, finalX;
-    int winCount = ctx->ui.mnk.winningCount;
-    int row = ctx->ui.mnk.board.y;
-    int col = ctx->ui.mnk.board.x;
-    if (p->position.y >= p->position.x) {
-        initX = p->position.x - winCount + 1 < 0 ? 0 : p->position.x - winCount + 1;
-        initY = p->position.y - (p->position.x - initX);
-
-        finalY = p->position.y + winCount - 1 >= row ? row - 1 : p->position.y + winCount - 1;
-        finalX = p->position.x + (finalY - p->position.y);
-    } else {
-        initY = p->position.y - winCount + 1 < 0 ? 0 : p->position.y - winCount + 1;
-        initX = p->position.x - (p->position.y - initY);
-
-        finalX = p->position.x + winCount - 1 >= col ? col - 1 : p->position.x + winCount - 1;
-        finalY = p->position.y + (finalX - p->position.x);
-    }
-    bool isWin = false;
-    for (int y = initY, x = initX; y <= finalY; y++) {
-        if ((y + winCount - 1 >= row) || (x + winCount - 1 >= col)) {
-            break;
-        }
-        isWin = true;
-        for (int k = y, l = x; k < y + winCount - 1; k++, l++) {
-            if (chessData[k][l] == p->marker) {
-                if (chessData[k][l] != chessData[k + 1][l + 1]) {
-                    isWin = false;
-                    break;
-                }
-            } else {
-                isWin = false;
-            }
-        }
-        if (isWin){
-            //SetCurrentPlayerWinCount(ctx, p);
-            break;
-        }
-    }
-    return isWin;
+    return DetectBoardLine(ctx, p, chessData, 1, 1);
 }
 
 bool DetectSpecialVictory(GameLocalContext* ctx, Player* p, Piece chessData[MAX_SIZE][MAX_SIZE]) {
@@ -1062,38 +1012,50 @@ bool DetectWin(GameLocalContext* ctx, Player* p, Piece chessData[MAX_SIZE][MAX_S
     return false;
 }
 
+// 引き分けかどうか：どちらのプレイヤーも、もう勝利条件を満たせない場合に true を返す。
+// （盤面が埋まった場合も含む。長さ winningCount の窓に片方の石しかなければ、まだ勝てる可能性がある）
 bool DetectDraw(GameLocalContext* ctx) {
-    Piece cpB1[MAX_SIZE][MAX_SIZE];
-    Piece cpB2[MAX_SIZE][MAX_SIZE];
-    bool canWin = false;
-    for (int y = 0; y < ctx->ui.mnk.board.y; y++) {
-        for (int x = 0; x < ctx->ui.mnk.board.x; x++) {
-            cpB1[y][x] = (ctx->data.game.chessData[y][x]);
-            cpB2[y][x] = (ctx->data.game.chessData[y][x]);
-        }
-    }
-    // 盤面が全て埋まっているかどうかをチェック
-    for (int y = 0; y < ctx->ui.mnk.board.y; y++) {
-        for (int x = 0; x < ctx->ui.mnk.board.x; x++) {
-            if (ctx->data.game.chessData[y][x] == Piece::NONE_PIECE) {
-                cpB1[y][x] = Piece::BLACK_PIECE;
-                // 盤面に黒を置いて勝利判定
-                
-                canWin = DetectWin(ctx, &ctx->data.game.masterPlayer, cpB1);
-                if (canWin) {
-                    return true;
-                }
+    int winCount = ctx->ui.mnk.winningCount;
+    int row = ctx->ui.mnk.board.y;
+    int col = ctx->ui.mnk.board.x;
+    const int dirs[4][2] = { { 1, 0 }, { 0, 1 }, { 1, 1 }, { 1, -1 } };
 
-                cpB2[y][x] = Piece::WHITE_PIECE;
-                // 盤面に黒を置いて勝利判定
-                canWin = DetectWin(ctx, &ctx->data.game.slavePlayer, cpB2);
-                if (canWin) {
-                    return true;
+    for (int d = 0; d < 4; d++) {
+        for (int y = 0; y < row; y++) {
+            for (int x = 0; x < col; x++) {
+                int ex = x + dirs[d][0] * (winCount - 1);
+                int ey = y + dirs[d][1] * (winCount - 1);
+                if (ex < 0 || ex >= col || ey < 0 || ey >= row) continue;
+
+                bool hasBlack = false, hasWhite = false;
+                for (int i = 0; i < winCount; i++) {
+                    Piece piece = ctx->data.game.chessData[y + dirs[d][1] * i][x + dirs[d][0] * i];
+                    hasBlack |= piece == Piece::BLACK_PIECE;
+                    hasWhite |= piece == Piece::WHITE_PIECE;
+                }
+                if (!hasBlack || !hasWhite) {
+                    return false;
                 }
             }
         }
     }
-    return false;
+
+    // 特別勝利（四隅）がまだ可能か
+    if (ctx->session->config.specialVictory) {
+        Piece corners[4] = {
+            ctx->data.game.chessData[0][0], ctx->data.game.chessData[0][col - 1],
+            ctx->data.game.chessData[row - 1][0], ctx->data.game.chessData[row - 1][col - 1],
+        };
+        bool hasBlack = false, hasWhite = false;
+        for (Piece c : corners) {
+            hasBlack |= c == Piece::BLACK_PIECE;
+            hasWhite |= c == Piece::WHITE_PIECE;
+        }
+        if (!hasBlack || !hasWhite) {
+            return false;
+        }
+    }
+    return true;
 }
 
 #pragma endregion
@@ -1161,6 +1123,7 @@ void DefaultInitImpl(SceneInterface* self, GameSession* session) {
     GameLocalContext* ctx = new GameLocalContext;
     ctx->session = session;
     self->localContext = ctx;
+    ClearScreenBuffer(ctx);
 
     ctx->ui.border = SpritesEnvironmentBorder(*session);
 }
@@ -1223,10 +1186,11 @@ void Menu_KeyInput(SceneInterface* self) {
                     data.payload = &ReadmeScene;
                     break;
                 case 3: // 終了
-                    exit(0);
-                    break;
+                    // exit() だと現在のシーンの Shutdown と CmdGameFinalize が呼ばれないので、メインループを抜ける
+                    ctx->session->sys.running = false;
+                    return;
             }
-            DispatchEvent(new Event{ SYS_SCENE_CHANGE, &data });
+            DispatchEvent(SYS_SCENE_CHANGE, &data);
         }
     }
 }
@@ -1292,7 +1256,7 @@ void Config_KeyInput(SceneInterface* self) {
             static SceneChangeData data;
             extern SceneInterface MenuScene;
             data.payload = &MenuScene;
-            DispatchEvent(new Event{ SYS_SCENE_CHANGE, &data });
+            DispatchEvent(SYS_SCENE_CHANGE, &data);
         } else if (key == ENTER_KEY) {
             // 選択されたオプションに応じてシーンを切り替える
             if (ctx->data.config.selected == ctx->data.config.itemSize - 3) {
@@ -1305,7 +1269,7 @@ void Config_KeyInput(SceneInterface* self) {
                 static SceneChangeData data;
                 extern SceneInterface MenuScene;
                 data.payload = &MenuScene;
-                DispatchEvent(new Event{ SYS_SCENE_CHANGE, &data });
+                DispatchEvent(SYS_SCENE_CHANGE, &data);
             } else {
                 for (int i = 0; i < ctx->data.config.options.size(); i++) {
                     ctx->data.config.options[i].key = false;
@@ -1416,7 +1380,7 @@ void Readme_KeyInput(SceneInterface* self) {
             static SceneChangeData data;
             extern SceneInterface MenuScene;
             data.payload = &MenuScene;
-            DispatchEvent(new Event{ SYS_SCENE_CHANGE, &data });
+            DispatchEvent(SYS_SCENE_CHANGE, &data);
         }
     }
 }
@@ -1675,7 +1639,7 @@ void SelectedPointAction(GameLocalContext* ctx, Player* current, Player* next) {
                 current->runing = false;
                 // 勝利処理
                 SetCurrentPlayerWinCount(ctx, current);
-            } else if (!DetectDraw(ctx)) {
+            } else if (DetectDraw(ctx)) {
                 // 引き分け処理
                 current->isWin = false;
                 current->runing = false;
@@ -1793,14 +1757,14 @@ void Game_KeyInput(SceneInterface* self) {
             static SceneChangeData data;
             extern SceneInterface MenuScene;
             data.payload = &MenuScene;
-            DispatchEvent(new Event{ SYS_SCENE_CHANGE, &data });
+            DispatchEvent(SYS_SCENE_CHANGE, &data);
         } else if (key == SPACE) {
             ctx->ui.selected = true;
         } else if (key == R_KEY) {
             static SceneChangeData data;
             extern SceneInterface GameScene;
             data.payload = &GameScene;
-            DispatchEvent(new Event{ SYS_SCENE_CHANGE, &data });
+            DispatchEvent(SYS_SCENE_CHANGE, &data);
         }
     }
 }
@@ -1842,6 +1806,10 @@ void Game_Render(SceneInterface* self) {
     RenderToScreen(ctx);
 }
 void Game_Shutdown(SceneInterface* self) {
+    // AIはゲームシーンのコンテキストを参照しているので、解放後に使われないよう切り離す
+    if (func && func->localContext == self->localContext) {
+        func->localContext = NULL;
+    }
     DefaultShutdownImpl(self);
 }
 #pragma endregion
